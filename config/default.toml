@@ -1,0 +1,65 @@
+# Stellar DSP PID — Default Configuration
+# All physical units are stated in comments.
+
+[indi]
+host          = "localhost"
+port          = 7624
+camera_device = "ZWO CCD ASI120MM Mini"
+mount_device  = "EQMod Mount"
+# Guide camera exposure time (seconds). 2 s → 0.5 Hz update rate.
+guide_exposure = 2.0
+
+[dsp]
+# Internal DSP sample rate (Hz). Must be >= 2× guide_rate.
+# 10 Hz gives 20× oversampling at 0.5 Hz guide rate.
+sample_rate = 10.0
+
+# ZDF LP filter cutoff (Hz). Atmospheric seeing coherence time ≈ 10–100 ms
+# → seeing bandwidth ≈ 10–100 Hz. We want to pass corrections < 0.1 Hz.
+filter_cutoff_hz = 0.05
+
+# ZDF filter Q factor.
+# 0.7071 = Butterworth (maximally flat, no resonance peak).
+# 0.5    = critically damped (slowest settling, most overdamped).
+filter_q = 0.7071
+
+# Number of internal ticks between INDI guide frame arrivals.
+# Computed automatically from sample_rate / guide_rate; set here as override.
+oversample_ratio = 20
+
+[mount]
+# Worm gear period in seconds.
+# EQ6-R / HEQ5 Pro: 480 s (8-minute worm)
+# EQ3-2 / AZ-EQ5:   240 s
+# Harmonic drive (no worm): set to 0 to disable PE correction
+worm_period_secs = 480.0
+
+# Arcseconds of sky motion per millisecond of guide pulse.
+# Calibrate with a drift alignment run; typical EQ6-R at 0.5× rate: 1.65
+arcsec_per_ms_ra  = 1.65
+arcsec_per_ms_dec = 1.65
+
+# Pulse duration limits (milliseconds)
+max_pulse_ms = 2000.0
+min_pulse_ms = 10.0
+
+# Guide aggressiveness [0.0, 1.0]. Scales total correction output.
+aggressiveness = 0.8
+
+[guider]
+# PID feedback gains (applied to ZDF-filtered error)
+kp = 0.6
+ki = 0.02
+kd = 0.0
+
+# Integrator clamp (arcseconds). Prevents wind-up during clouds / lost star.
+integral_clamp = 10.0
+
+# Backlash compensation (ms). Set > 0 if DEC axis has mechanical backlash.
+backlash_compensation_ms = 0.0
+
+# Whether to apply PE feed-forward correction from the wavetable.
+enable_pe_correction = true
+
+# Path to saved PE curve JSON (written by --calibrate mode).
+# pe_curve_path = "config/pe_curve.json"

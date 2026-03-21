@@ -1,0 +1,78 @@
+[package]
+name            = "stellar-dsp-pid"
+version         = "0.1.0"
+edition         = "2021"
+authors         = ["Stellar DSP Contributors <dsp@stellar-pid.dev>"]
+description     = "Feed-forward DSP guiding engine — ZDF noise cancellation + wavetable PE correction"
+license         = "MIT"
+repository      = "https://github.com/your-org/Stellar_DSP_PID"
+readme          = "README.md"
+keywords        = ["astrophotography", "dsp", "pid", "indi", "telescope"]
+categories      = ["science", "embedded", "multimedia::audio"]
+rust-version    = "1.75"
+
+[lib]
+name = "stellar_dsp_pid"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stellar-dsp-pid"
+path = "src/main.rs"
+
+# ── Runtime dependencies ───────────────────────────────────────────────────
+[dependencies]
+# Async runtime
+tokio          = { version = "1.37",  features = ["full"] }
+tokio-util     = { version = "0.7",   features = ["codec"] }
+
+# XML parsing for INDI protocol
+quick-xml      = { version = "0.31",  features = [] }
+
+# Serialization / configuration
+serde          = { version = "1.0",   features = ["derive"] }
+serde_json     = "1.0"
+toml           = "0.8"
+
+# Dense linear algebra (Kalman smoother future work)
+nalgebra       = { version = "0.32",  default-features = false, features = ["std"] }
+
+# Numeric utilities
+num-traits     = "0.2"
+num-complex    = "0.4"
+
+# Lock-free ring buffer for inter-task sample passing
+ringbuf        = "0.4"
+
+# Logging
+log            = "0.4"
+env_logger     = "0.11"
+
+# Error handling
+thiserror      = "1.0"
+anyhow         = "1.0"
+
+# CLI argument parsing
+clap           = { version = "4.5",   features = ["derive"] }
+
+# ── Dev / bench dependencies ───────────────────────────────────────────────
+[dev-dependencies]
+criterion      = { version = "0.5",   features = ["html_reports"] }
+approx         = "0.5"
+tokio          = { version = "1.37",  features = ["full", "test-util"] }
+
+[[bench]]
+name    = "dsp_bench"
+harness = false
+
+# ── Release profile: maximum optimisation, zero-cost abstractions ──────────
+[profile.release]
+opt-level      = 3
+lto            = "fat"
+codegen-units  = 1
+panic          = "abort"
+strip          = "symbols"
+
+[profile.bench]
+opt-level      = 3
+lto            = "thin"
+codegen-units  = 1

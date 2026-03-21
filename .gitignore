@@ -1,0 +1,8 @@
+/target/
+/Cargo.lock
+*.pe_curve.json
+config/local.toml
+**/*.rs.bk
+.DS_Store
+*.log
+criterion/
