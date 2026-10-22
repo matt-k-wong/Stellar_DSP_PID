@@ -16,6 +16,8 @@ pub struct IndiConfig {
     pub host:          String,
     #[serde(default = "default_port")]
     pub port:          u16,
+    /// INDI device publishing verified arcsecond measurements. This may be a
+    /// future centroid bridge distinct from the physical guide camera.
     pub camera_device: String,
     pub mount_device:  String,
     /// Guide camera exposure time (seconds)
@@ -81,13 +83,28 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.dsp.sample_rate > 0.0, "dsp.sample_rate must be positive");
+        anyhow::ensure!(self.dsp.sample_rate.is_finite() && self.dsp.sample_rate > 0.0,
+            "dsp.sample_rate must be finite and positive");
         anyhow::ensure!(self.dsp.filter_cutoff_hz > 0.0
             && self.dsp.filter_cutoff_hz < self.dsp.sample_rate / 2.0,
             "filter_cutoff_hz must be in (0, sample_rate/2)");
         anyhow::ensure!(self.dsp.filter_q >= 0.5, "filter_q must be >= 0.5");
-        anyhow::ensure!(self.mount.max_pulse_ms > self.mount.min_pulse_ms,
-            "max_pulse_ms must exceed min_pulse_ms");
+        anyhow::ensure!(self.indi.guide_exposure.is_finite() && self.indi.guide_exposure > 0.0,
+            "indi.guide_exposure must be finite and positive");
+        anyhow::ensure!(self.mount.worm_period_secs.is_finite()
+            && self.mount.worm_period_secs >= 0.0,
+            "mount.worm_period_secs must be finite and non-negative (0 disables PE)");
+        anyhow::ensure!(self.mount.arcsec_per_ms_ra.is_finite()
+            && self.mount.arcsec_per_ms_ra > 0.0,
+            "mount.arcsec_per_ms_ra must be finite and positive");
+        anyhow::ensure!(self.mount.arcsec_per_ms_dec.is_finite()
+            && self.mount.arcsec_per_ms_dec > 0.0,
+            "mount.arcsec_per_ms_dec must be finite and positive");
+        anyhow::ensure!(self.mount.min_pulse_ms.is_finite() && self.mount.min_pulse_ms >= 0.0,
+            "mount.min_pulse_ms must be finite and non-negative");
+        anyhow::ensure!(self.mount.max_pulse_ms.is_finite()
+            && self.mount.max_pulse_ms > self.mount.min_pulse_ms,
+            "mount.max_pulse_ms must be finite and exceed min_pulse_ms");
         anyhow::ensure!(self.mount.aggressiveness >= 0.0
             && self.mount.aggressiveness <= 1.0,
             "aggressiveness must be in [0, 1]");

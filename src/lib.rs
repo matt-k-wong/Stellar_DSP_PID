@@ -15,7 +15,7 @@ pub enum Axis { Ra, Dec }
 /// A single guide measurement arriving from the INDI stream.
 #[derive(Debug, Clone, Copy)]
 pub struct GuideFrame {
-    /// Timestamp (seconds since UNIX epoch)
+    /// Source capture time in Unix seconds from `CAPTURE_UNIX_SECONDS`.
     pub timestamp: f64,
     /// RA tracking error (arcseconds, positive = East)
     pub ra_error_arcsec: f64,

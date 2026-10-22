@@ -1,6 +1,7 @@
 /target/
-/Cargo.lock
 *.pe_curve.json
+/config/pe_curve.json
+**/synscan_wifi_probe_*.txt
 config/local.toml
 **/*.rs.bk
 .DS_Store

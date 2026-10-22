@@ -2,10 +2,10 @@
 name            = "stellar-dsp-pid"
 version         = "0.1.0"
 edition         = "2021"
-authors         = ["Stellar DSP Contributors <dsp@stellar-pid.dev>"]
+authors         = ["Stellar DSP contributors"]
 description     = "Feed-forward DSP guiding engine — ZDF noise cancellation + wavetable PE correction"
 license         = "MIT"
-repository      = "https://github.com/your-org/Stellar_DSP_PID"
+repository      = "https://github.com/matt-k-wong/Stellar_DSP_PID"
 readme          = "README.md"
 keywords        = ["astrophotography", "dsp", "pid", "indi", "telescope"]
 categories      = ["science", "embedded", "multimedia::audio"]

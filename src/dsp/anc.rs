@@ -99,6 +99,8 @@ pub struct AncEngine {
     dec_filtered: f64,
     /// SNR weight from last frame (0.0 if lost star)
     snr_weight:   f64,
+    /// Accumulated PE displacement not yet large enough for a mount pulse.
+    ff_pending_ms: f64,
 
     // ── Configuration scalars ──────────────────────────────────────────────
     aggressiveness:   f64,
@@ -106,6 +108,7 @@ pub struct AncEngine {
     min_pulse_ms:     f64,
     arcsec_per_ms_ra: f64,
     arcsec_per_ms_dec: f64,
+    pe_enabled: bool,
 
     // ── Diagnostics ────────────────────────────────────────────────────────
     pub stats: AncStats,
@@ -135,11 +138,13 @@ impl AncEngine {
             ra_filtered:     0.0,
             dec_filtered:    0.0,
             snr_weight:      1.0,
+            ff_pending_ms:   0.0,
             aggressiveness:  mount.aggressiveness,
             max_pulse_ms:    mount.max_pulse_ms,
             min_pulse_ms:    mount.min_pulse_ms,
             arcsec_per_ms_ra:  mount.arcsec_per_ms_ra,
             arcsec_per_ms_dec: mount.arcsec_per_ms_dec,
+            pe_enabled: guide.enable_pe_correction,
             stats: AncStats::default(),
         }
     }
@@ -178,7 +183,19 @@ impl AncEngine {
     #[inline(always)]
     pub fn tick(&mut self) -> GuidePulse {
         // ── Feed-forward: PE wavetable ──────────────────────────────────────
-        let ff_ms = self.pe_table.tick();
+        let ff_delta_ms = if self.pe_enabled { self.pe_table.tick() } else { 0.0 };
+        if self.pe_enabled {
+            self.ff_pending_ms += ff_delta_ms;
+        } else {
+            self.ff_pending_ms = 0.0;
+        }
+        let ff_ms = if self.ff_pending_ms.abs() >= self.min_pulse_ms {
+            let emitted = self.ff_pending_ms.clamp(-self.max_pulse_ms, self.max_pulse_ms);
+            self.ff_pending_ms -= emitted;
+            emitted
+        } else {
+            0.0
+        };
 
         // ── Feedback: ZDF-filtered PID ──────────────────────────────────────
         let ra_fb_arcsec  = self.ra_pid.process(self.ra_filtered,  self.ra_filtered);
@@ -221,16 +238,26 @@ impl AncEngine {
         self.pe_table.calibrate_from_samples(samples);
     }
 
+    /// Enable wavetable playback at a measured physical worm phase.
+    /// The phase must come from a reliable mount reference; choosing an
+    /// arbitrary phase can make feed-forward corrections increase the error.
+    pub fn synchronize_pe_phase(&mut self, phase: f64) {
+        if self.pe_enabled {
+            self.pe_table.set_phase(phase);
+        }
+    }
+
     /// Reset all DSP state (filters, PIDs, PE phase).
     pub fn reset(&mut self) {
         self.ra_filter.reset();
         self.dec_filter.reset();
         self.ra_pid.reset();
         self.dec_pid.reset();
-        self.pe_table.set_phase(0.0);
+        self.pe_table.clear_phase_sync();
         self.ra_filtered  = 0.0;
         self.dec_filtered = 0.0;
         self.snr_weight   = 1.0;
+        self.ff_pending_ms = 0.0;
         self.stats.reset();
     }
 
@@ -297,14 +324,32 @@ mod tests {
     }
 
     #[test]
-    fn pe_correction_applied_after_load() {
-        let (dsp, mount, guide) = make_config();
+    fn pe_correction_waits_for_phase_and_emits_position_delta() {
+        let (dsp, mut mount, guide) = make_config();
+        // Use a plausible theoretical 0.5x-sidereal scale and zero pulse
+        // dead-band so this checks the DSP displacement itself.
+        mount.arcsec_per_ms_ra = 0.007521;
+        mount.min_pulse_ms = 0.0;
         let mut engine = AncEngine::new(&dsp, &mount, &guide);
-        // Load a flat +5 arcsec PE curve
-        let flat_pe: Vec<f64> = vec![5.0f64; 1024];
-        engine.load_pe_curve(&flat_pe);
+        let amplitude = 5.0f64;
+        let pe: Vec<f64> = (0..1024)
+            .map(|i| amplitude * (2.0 * core::f64::consts::PI * i as f64 / 1024.0).sin())
+            .collect();
+        engine.load_pe_curve(&pe);
+
+        assert!(!engine.pe_table().is_enabled());
+        assert_eq!(engine.tick().ra_west_ms, 0.0,
+            "a curve without a physical phase reference must not emit pulses");
+
+        // The fixture supplies the known phase for this synthetic sinusoid.
+        engine.synchronize_pe_phase(0.25);
+        assert!(engine.pe_table().is_enabled());
         let pulse = engine.tick();
-        // Flat curve → constant correction; with arcsec_per_ms=1.65, expect ~3 ms
-        assert!(pulse.ra_west_ms.abs() > 1.0, "PE correction not applied");
+        // At the inverse sine's minimum the position is -5 arcsec; advancing
+        // phase makes it slightly less negative, so this tick's delta is tiny
+        // and positive even though the full position is negative.
+        assert!(pulse.ra_west_ms > 0.0);
+        assert!(pulse.ra_west_ms.abs() < 0.01,
+            "expected one-tick displacement, got {} ms", pulse.ra_west_ms);
     }
 }

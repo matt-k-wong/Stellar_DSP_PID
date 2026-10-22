@@ -5,7 +5,7 @@ use approx::assert_abs_diff_eq;
 use stellar_dsp_pid::{
     config::{DspConfig, GuiderConfig, MountConfig},
     dsp::{AncEngine, ZdfFourPole, ZdfOnePole, ZdfSvf},
-    GuideFrame, GuidePulse,
+    GuideFrame,
 };
 
 fn dsp_cfg(fs: f64, fc: f64) -> DspConfig {
@@ -89,39 +89,45 @@ fn four_pole_is_lower_than_two_pole_at_stopband() {
 // ── AncEngine ───────────────────────────────────────────────────────────────
 
 #[test]
-fn anc_pe_correction_reduces_ra_error() {
-    let mut engine = AncEngine::new(&dsp_cfg(10.0, 0.05), &mount_cfg(), &guide_cfg());
-    // Synthetic sinusoidal PE
-    let amplitude = 10.0f64;
+fn anc_pe_correction_requires_phase_and_integrates_position_deltas() {
+    let mut mount = mount_cfg();
+    mount.arcsec_per_ms_ra = 0.007521;
+    mount.min_pulse_ms = 0.0;
+    let mut guide = guide_cfg();
+    guide.enable_pe_correction = true;
+    let mut engine = AncEngine::new(&dsp_cfg(10.0, 0.05), &mount, &guide);
+    let amplitude = 5.0f64;
     let n = 4096usize;
     let pe: Vec<f64> = (0..n)
         .map(|i| amplitude * (2.0 * std::f64::consts::PI * i as f64 / n as f64).sin())
         .collect();
     engine.load_pe_curve(&pe);
 
-    // Run for 1 worm cycle; measure residual RMS
-    let ticks = (480.0 * 10.0) as usize; // 1 worm cycle at 10 Hz
-    let mut residual_sq = 0.0f64;
-    for i in 0..ticks {
-        let t = i as f64 / 10.0;
-        let actual_pe = amplitude * (2.0 * std::f64::consts::PI * t / 480.0).sin();
-        let frame = GuideFrame {
-            timestamp: t, ra_error_arcsec: actual_pe, dec_error_arcsec: 0.0,
-            star_flux: 50_000.0, valid: true,
-        };
-        engine.update_measurement(&frame);
-        let pulse = engine.tick();
-        // Residual: actual PE minus what the feed-forward predicted
-        let ff_arcsec = pulse.ra_west_ms * 1.65; // convert back to arcsec
-        residual_sq += (actual_pe + ff_arcsec).powi(2);
-    }
-    let residual_rms = (residual_sq / ticks as f64).sqrt();
-    let input_rms    = amplitude / std::f64::consts::SQRT_2;
-    // Residual should be less than 30% of input RMS (crude acceptance test)
+    assert!(!engine.pe_table().is_enabled());
+    assert_eq!(engine.tick().ra_west_ms, 0.0,
+        "loading a curve alone must not arm PE output");
+
+    // For this synthetic fixture, phase zero is a known reference. Over ten
+    // ticks, integrated pulse displacement should equal the change in inverse
+    // PE position, rather than sending the full position once per tick.
+    engine.synchronize_pe_phase(0.0);
+    assert!(engine.pe_table().is_enabled());
+    let ticks = 10usize;
+    let integrated_arcsec: f64 = (0..ticks)
+        .map(|_| engine.tick().ra_west_ms * mount.arcsec_per_ms_ra)
+        .sum();
+    let expected_arcsec = -amplitude
+        * (2.0 * std::f64::consts::PI * ticks as f64 / (480.0 * 10.0)).sin();
     assert!(
-        residual_rms < 0.3 * input_rms,
-        "PE cancellation insufficient: residual_rms={residual_rms:.2}, input_rms={input_rms:.2}"
+        (integrated_arcsec - expected_arcsec).abs() < 0.001,
+        "integrated pulse displacement {integrated_arcsec:.6} arcsec should match per-cycle position delta {expected_arcsec:.6} arcsec"
     );
+    assert!(integrated_arcsec < 0.0);
+
+    // A new reset invalidates the phase reference and closes the output gate.
+    engine.reset();
+    assert!(!engine.pe_table().is_enabled());
+    assert_eq!(engine.tick().ra_west_ms, 0.0);
 }
 
 #[test]

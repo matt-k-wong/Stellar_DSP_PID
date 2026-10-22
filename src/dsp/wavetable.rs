@@ -2,29 +2,27 @@
 //!
 //! ## Physics
 //!
-//! A worm gear introduces a cycloidal position error E(φ) that repeats
-//! exactly every worm-gear revolution (period T_worm).  In right ascension
-//! the mount's true angle θ(t) is:
+//! A worm gear can introduce a position error E(φ) that approximately repeats
+//! with worm phase (period T_worm). In right ascension the mount's true angle
+//! θ(t) can be modeled as:
 //!
 //! ```text
 //!   θ(t) = Ω·t + E(φ(t))     where φ(t) = 2π·t / T_worm
 //! ```
 //!
-//! The peak-to-peak amplitude of E is typically 5–30″ for consumer mounts.
+//! The amplitude and repeatability must be measured on the individual mount.
 //!
 //! ## Feed-Forward Strategy
 //!
 //! We store samples of −E(φ) (the *inverse* of the measured PE curve)
-//! in a length-N lookup table and read it out continuously via a
-//! phase-locked oscillator running at the DSP tick rate.
+//! in a length-N lookup table. Playback remains disabled until an external,
+//! reliable source synchronizes the oscillator to physical mount phase.
 //!
-//! At each DSP tick the synthesiser outputs a correction δ (arcseconds)
-//! that the ANC engine converts to a guide pulse duration (ms).
+//! At each DSP tick the synthesiser computes the change in desired position
+//! since the prior tick and converts that displacement to a guide pulse.
 //!
-//! The net effect: the mount receives pulses that pre-cancel its own PE
-//! before the error manifests on the guide star.  The guide camera then
-//! sees a residual PE of σ_residual ≈ σ_table_noise + σ_worm_cycle_error,
-//! typically < 1″ rms even for consumer mounts.
+//! The intended effect is to cancel repeatable PE. Improvement depends on
+//! curve quality, phase synchronization, pulse response, and mount behavior.
 //!
 //! ## Interpolation
 //!
@@ -38,7 +36,8 @@
 //!
 //! 1. **Phase-binning** (`calibrate_from_samples`): bin star-error
 //!    measurements into N phase slots over multiple worm cycles, average.
-//!    Converges in 2–3 cycles.  Robust to seeing; σ_fit ≈ σ_seeing / √n_cycles.
+//!    The supplied capture timestamps do not identify physical worm phase, so
+//!    a curve produced this way is not ready for playback by itself.
 //!
 //! 2. **Direct load** (`load_curve`): supply a pre-measured PE vector from
 //!    external software (PEMPro, PHD2 PE log).  Resamples to N points with
@@ -81,8 +80,14 @@ pub struct PeriodicErrorTable<const N: usize> {
     // Oscillator state ──────────────────────────────────────────────────────
     /// Current phase accumulator ∈ [0.0, 1.0)
     phase: f64,
+    /// Last inverse-PE position sent to the mount, in arcseconds.
+    last_correction_arcsec: f64,
     /// Phase advance per DSP sample: 1 / (T_worm · fs)
     phase_increment: f64,
+    /// A curve alone is insufficient: playback must be aligned to the mount's
+    /// physical worm phase before any correction can be sent.
+    curve_loaded: bool,
+    phase_synchronized: bool,
 
     // Physical parameters ───────────────────────────────────────────────────
     /// Worm gear period (seconds)
@@ -97,8 +102,8 @@ pub struct PeriodicErrorTable<const N: usize> {
     pub rms_arcsec: f64,
 
     // Control flags ─────────────────────────────────────────────────────────
-    /// False until a valid curve is loaded; tick() returns 0 when false
-    pub enabled: bool,
+    /// False until a curve is loaded and its phase is explicitly synchronized.
+    enabled: bool,
 }
 
 impl<const N: usize> PeriodicErrorTable<N> {
@@ -114,7 +119,14 @@ impl<const N: usize> PeriodicErrorTable<N> {
         Self {
             table:           Box::new([0.0f64; N]),
             phase:           0.0,
-            phase_increment: (worm_period * sample_rate).recip(),
+            last_correction_arcsec: 0.0,
+            phase_increment: if worm_period.is_finite() && worm_period > 0.0 {
+                (worm_period * sample_rate).recip()
+            } else {
+                0.0
+            },
+            curve_loaded: false,
+            phase_synchronized: false,
             worm_period,
             sample_rate,
             arcsec_per_ms,
@@ -166,23 +178,29 @@ impl<const N: usize> PeriodicErrorTable<N> {
         }
         self.amplitude_pp = max_val - min_val;
         self.rms_arcsec   = (sum_sq / N as f64).sqrt();
-        self.enabled      = true;
+        self.curve_loaded = true;
+        self.last_correction_arcsec = self.position_at_phase(self.phase);
+        self.enabled = self.phase_synchronized;
     }
 
     /// Calibrate from raw star-error time-series measurements.
     ///
-    /// `samples` is a slice of `(timestamp_sec, error_arcsec)` pairs
-    /// spanning at least two worm cycles for adequate phase coverage.
+    /// `samples` is a slice of `(timestamp_sec, error_arcsec)` pairs.
     ///
     /// **Algorithm:**
-    /// 1. Map each timestamp to a worm phase φ = frac(t / T_worm).
+    /// 1. Map each timestamp to φ = frac(t / T_worm) using the timestamp
+    ///    origin. This is not the mount's physical worm phase unless an
+    ///    external phase reference is supplied.
     /// 2. Accumulate measurements into N phase bins (nearest-neighbour).
     /// 3. Forward-fill empty bins by linear interpolation.
     /// 4. Call `load_curve` on the averaged bins.
     ///
-    /// Robustness to seeing: σ_residual ≈ σ_seeing / √(n_cycles · n_bin_hits).
+    /// A curve built from timestamps alone remains disabled until the caller
+    /// separately synchronizes it to a physical worm phase.
     pub fn calibrate_from_samples(&mut self, samples: &[(f64, f64)]) {
-        if samples.is_empty() { return; }
+        if samples.is_empty() || !self.worm_period.is_finite() || self.worm_period <= 0.0 {
+            return;
+        }
 
         let mut sum    = vec![0.0f64; N];
         let mut count  = vec![0u32;   N];
@@ -227,8 +245,8 @@ impl<const N: usize> PeriodicErrorTable<N> {
     // Real-time playback (hot path)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Advance the phase by one DSP sample and return the feed-forward
-    /// correction in **milliseconds of guide pulse**.
+    /// Advance the phase by one DSP sample and return the change in
+    /// feed-forward position as **milliseconds of guide pulse**.
     ///
     /// Positive = West (advances RA); negative = East (retards RA).
     ///
@@ -243,44 +261,80 @@ impl<const N: usize> PeriodicErrorTable<N> {
         // Subtract instead of fmod — one branch, one op vs ~20 ops for fmod
         if self.phase >= 1.0 { self.phase -= 1.0; }
 
-        // Fractional table index
-        let idx_f  = self.phase * N as f64;
-        let idx0   = idx_f as usize & (N - 1);          // bitmask: N is power-of-2
+        let position_arcsec = self.position_at_phase(self.phase);
+        let correction_delta_arcsec = position_arcsec - self.last_correction_arcsec;
+        self.last_correction_arcsec = position_arcsec;
+
+        // INDI pulse duration commands a displacement. Convert only the
+        // per-tick change in the target position, never the full position
+        // curve on every tick.
+        correction_delta_arcsec / self.arcsec_per_ms
+    }
+
+    #[inline(always)]
+    fn position_at_phase(&self, phase: f64) -> f64 {
+        let idx_f  = phase * N as f64;
+        let idx0   = idx_f as usize & (N - 1);
         let idx_m1 = idx0.wrapping_sub(1) & (N - 1);
         let idx1   = (idx0 + 1) & (N - 1);
         let idx2   = (idx0 + 2) & (N - 1);
-        let frac   = idx_f.fract();
-
-        let correction_arcsec = hermite4(
+        hermite4(
             self.table[idx_m1],
             self.table[idx0],
             self.table[idx1],
             self.table[idx2],
-            frac,
-        );
-        // Convert arcseconds → guide pulse milliseconds
-        correction_arcsec / self.arcsec_per_ms
+            idx_f.fract(),
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────────
     // Diagnostics / control
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Force-synchronise the oscillator phase.
-    /// Used when an external encoder reading is available.
+    /// Synchronize the oscillator to a known physical worm phase.
+    ///
+    /// Calling this method asserts that the supplied phase came from a
+    /// reliable mount phase reference. Do not pass zero just to start playback:
+    /// a loaded curve without physical phase synchronization remains disabled.
     #[inline]
     pub fn set_phase(&mut self, phase: f64) {
+        if !phase.is_finite() {
+            self.clear_phase_sync();
+            return;
+        }
         self.phase = phase.fract().abs();
+        self.last_correction_arcsec = self.position_at_phase(self.phase);
+        self.phase_synchronized = true;
+        self.enabled = self.curve_loaded;
+    }
+
+    /// Forget phase synchronization after a reset, power loss, or worm-period
+    /// change. A new physical reference is required before playback resumes.
+    #[inline]
+    pub fn clear_phase_sync(&mut self) {
+        self.phase = 0.0;
+        self.last_correction_arcsec = 0.0;
+        self.phase_synchronized = false;
+        self.enabled = false;
     }
 
     /// Current oscillator phase ∈ [0.0, 1.0).
     #[inline]
     pub fn phase(&self) -> f64 { self.phase }
 
+    /// Whether a loaded curve is armed at a synchronized physical phase.
+    #[inline]
+    pub fn is_enabled(&self) -> bool { self.enabled }
+
     /// Update worm period and recompute phase increment.
     pub fn set_worm_period(&mut self, worm_period: f64) {
         self.worm_period      = worm_period;
-        self.phase_increment  = (worm_period * self.sample_rate).recip();
+        self.phase_increment  = if worm_period.is_finite() && worm_period > 0.0 {
+            (worm_period * self.sample_rate).recip()
+        } else {
+            0.0
+        };
+        self.clear_phase_sync();
     }
 
     /// Serialise the table to a JSON-compatible vector (for persistence).

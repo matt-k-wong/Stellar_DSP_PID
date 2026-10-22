@@ -1,0 +1,50 @@
+# Illustrative profile for the SkyView Pro family with a SynScan V3 handset
+# and SynScan Wi-Fi adapter. This is not an inventory of a particular setup.
+# Verify all device names, compatibility, rates, and physical measurements.
+# The worked numerical examples below are conditional estimates only.
+
+[indi]
+host = "localhost"
+port = 7624
+# Keep empty until a verified centroid bridge publishes GUIDE_ERROR_ARCSEC.
+camera_device = ""
+# Candidate INDI name only; inspect the driver before connecting.
+mount_device = "EQMod Mount"
+guide_exposure = 2.0
+
+[dsp]
+sample_rate = 10.0
+filter_cutoff_hz = 0.05
+filter_q = 0.7071
+oversample_ratio = 20
+
+[mount]
+# Conditional calculation assuming a 144-tooth RA wheel:
+# 86164.0905 s sidereal day / 144 = 598.3617 s. The wheel tooth count and
+# physical period vary by mount and must be verified/measured. The SkyView Pro
+# manual's 480 s PEC-training interval is not a worm-period measurement.
+worm_period_secs = 598.3617
+
+# Illustrative ideal 0.5x-sidereal scale at Dec 0:
+# 15.04157 arcsec/s * 0.5 / 1000 = 0.007521 arcsec/ms. This is not a selected
+# guide rate or measured pulse response; measure the actual setup.
+# RA image-plane response also depends on declination and axis transform.
+arcsec_per_ms_ra = 0.007521
+arcsec_per_ms_dec = 0.007521
+
+max_pulse_ms = 1000.0
+min_pulse_ms = 10.0
+# Keep feedback disarmed until centroid conversion and pulse response are
+# verified on the actual setup.
+aggressiveness = 0.0
+
+[guider]
+kp = 0.6
+ki = 0.02
+kd = 0.0
+integral_clamp = 10.0
+backlash_compensation_ms = 0.0
+enable_pe_correction = false
+# Do not set a PE curve until a measured curve can be synchronized to physical
+# worm phase.
+# pe_curve_path = "config/pe_curve.json"

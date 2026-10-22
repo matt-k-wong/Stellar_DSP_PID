@@ -20,18 +20,18 @@ injects corrections that are *out of phase* with actual tracking errors.
 
 ### 1.2 Worm Gear Periodic Error
 
-A worm-and-wheel drive has eccentricity ε in its mesh.  As the worm rotates,
-the RA axis experiences a sinusoidal position modulation:
+A worm-and-wheel drive can introduce periodic RA position error. A simplified
+model is:
 
 ```
 θ_actual(t) = Ω·t + A·sin(2π·t/T_worm + φ_0)
 ```
 
-The PID controller measures the error caused by this at time t, computes a
-correction, and applies it — but the guide pulse executes *after* a full
-exposure cycle (2 s) plus communication latency.  With T_worm = 480 s,
-a 2–4 s lag represents 1.5–3° of worm phase: the correction arrives when
-the PE has the *opposite* sign, amplifying the error instead of cancelling it.
+Feedback latency can matter, but the worm period, error shape, and cycle phase
+must be measured for the actual mount. There is no universal 480 s period for
+the supported mounts. The illustrative SkyView profile records 598.36 s as a
+144-tooth calculation and notes the conflicting 480 s Orion PEC-training
+interval; neither value is a measurement of that particular mount.
 
 ---
 
@@ -118,41 +118,48 @@ Total cost: 9 multiplies, 8 adds, 0 divisions, 0 branches per sample.
 
 ### 3.1 Measurement
 
-The mount's true PE curve E(φ) is measured by recording the RA guide error
-over N ≥ 3 complete worm cycles while mount tracking is active and guiding
-is disabled (open-loop).  The measurements are phase-binned:
+The mount's true PE curve E(φ) must be measured by recording RA guide error
+while tracking is active and mount guide output is disabled. A physical worm
+phase reference is required to map timestamps to repeatable phase bins. The
+current capture command bins by timestamps but has no physical phase input, so
+its output is an analysis artifact and is not replay-ready.
 
 ```
-φ_i = frac(t_i / T_worm)
+φ_i = measured physical worm phase at sample i
 bin_index = floor(φ_i · N_table)
 bin_sum[k]   += error[i]
 bin_count[k] += 1
 ```
 
-After collection, each bin is averaged.  Empty bins are linearly interpolated.
-The RMS of the residual (after subtracting the fitted curve from raw data)
-converges as σ_residual ≈ σ_seeing / sqrt(n_cycles · n_hits_per_bin).
+After collection, populated bins can be averaged and empty bins interpolated.
+Fit quality must be evaluated against raw data across multiple cycles; a
+convergence formula does not replace measurements of noise, drift, or
+cycle-to-cycle repeatability.
 
 ### 3.2 Feed-Forward Synthesis
 
-The wavetable stores samples of −E(φ) (the *inverse* PE curve).  A phase
-accumulator advances by Δφ = 1/(T_worm · fs) per DSP tick:
+The wavetable stores samples of −E(φ) (the inverse PE position curve). Playback
+is disabled until the oscillator is synchronized to a known physical worm
+phase. A phase accumulator then advances by Δφ = 1/(T_worm · fs) per DSP tick:
 
 ```
 φ[n+1] = φ[n] + Δφ  (mod 1)
-correction[n] = −E(φ[n]) / arcsec_per_ms
+pulse[n] = (−E(φ[n+1]) + E(φ[n])) / arcsec_per_ms
 ```
 
-The readout uses Hermite cubic (Catmull-Rom) interpolation between four
-nearest table entries.  This gives C¹ continuity and suppresses interpolation
-noise by ~30 dB compared to linear interpolation for the same table size.
+The pulse uses only the change in desired position at this tick; applying the
+full position as a pulse on every tick would repeatedly command the same
+displacement. The readout uses Hermite cubic (Catmull-Rom) interpolation
+between four nearest table entries. The phase must be synchronized again after
+period changes or loss of mount phase.
 
 ### 3.3 Accuracy Budget
 
-For a 4096-point table over T_worm = 480 s, the time resolution per bin is:
+For a 4096-point table and a known period T_worm, the nominal time resolution
+per bin is:
 
 ```
-Δt_bin = T_worm / N = 480/4096 ≈ 0.117 s
+Δt_bin = T_worm / N
 ```
 
 The maximum interpolation error for Hermite interpolation of a sinusoid is:
@@ -161,8 +168,9 @@ The maximum interpolation error for Hermite interpolation of a sinusoid is:
 ε_max ≈ (π·f_PE·Δt_bin)^4 / 384 · A_PE
 ```
 
-For a 5-arcsecond peak PE: ε_max ≈ 0.0002″ — negligible compared to
-centroid measurement noise (σ_centroid ≈ 0.1–0.5″ for typical setups).
+Interpolation error depends on measured curve shape and sampling. It should be
+compared with the actual centroid noise and mount repeatability, rather than a
+generic performance claim.
 
 ---
 
@@ -180,9 +188,10 @@ where:
 - `a` = aggressiveness scalar ∈ [0,1]
 - `PID(·)` = discrete-time PID with trapezoidal integration
 
-The ZDF filter decouples the PID from seeing noise; the wavetable removes
-the dominant periodic error before it reaches the guide star; the PID
-handles residual drift (polar alignment error, refraction, mount flexure).
+The ZDF filter can shape feedback bandwidth; a correctly measured and
+phase-synchronized wavetable may compensate repeatable periodic error; PID
+feedback handles residual guide error. The supplied profiles keep PE disabled
+until measurement and phase synchronization are available.
 
 ---
 
@@ -192,14 +201,14 @@ The INDI guide frame arrival rate (0.5–2 Hz) is much lower than the
 desired correction rate.  Running the DSP engine at a higher internal
 rate (`sample_rate`, default 10 Hz) provides:
 
-1. **Smooth PE correction pulses** — the wavetable advances 20× per guide
-   frame, so corrections are issued every 100 ms rather than every 2 s.
-   This reduces the instantaneous pulse amplitude by 20× for the same
-   total correction, reducing mount excitation.
+1. **More frequent DSP updates** — the wavetable can advance between guide
+   frames. Actual mount pulse size, driver timing, minimum pulse width, and
+   accumulated correction need to be validated for the selected mount.
 
 2. **Filter state continuity** — the ZDF filters evolve their states between
    guide frames via a zero-input response.  When a new frame arrives the
    filter already has the correct memory of recent history.
 
-3. **Latency headroom** — at 10 Hz the correction loop can respond within
-   100 ms to a sudden mount disturbance even if no new guide frame has arrived.
+3. **No new visual information** — a higher DSP tick rate does not provide a
+   new camera measurement between guide frames. It must not be treated as
+   evidence that the mount error is known at each internal tick.

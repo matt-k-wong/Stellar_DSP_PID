@@ -1,82 +1,95 @@
-# Calibration Guide
+# Calibration and tuning notes
 
-## Step 1: Baseline Polar Alignment
+Calibration requires real guide-star measurements. With no guide camera, use
+the offline `inspect` command and hardware checklist in
+[the SkyView first setup guide](skyview_pro_example_setup.md). Do not run PE
+capture or guide mode with assumed camera units.
 
-Before calibrating PE, ensure your polar alignment error is < 5 arcminutes.
-Poor polar alignment introduces a secular RA/DEC drift that contaminates the
-PE curve measurement.
+## 1. Establish the measurement units
 
-Use your preferred drift alignment tool (SharpCap, PoleMaster, PHD2 drift).
+The current guider accepts only a configured measurement device publishing the
+project's `GUIDE_ERROR_ARCSEC` property. `indi.camera_device` names that INDI
+source and may be the future centroid bridge rather than the physical camera.
+Ordinary camera drivers cannot publish the custom property by themselves. Its
+RA and Dec values must be signed
+sky-axis errors in arcseconds, `STAR_FLUX` must be positive, and
+`CAPTURE_UNIX_SECONDS` must carry the source capture time in Unix seconds. Do
+not substitute the INDI message arrival time. Timestamps must be finite,
+strictly increasing, and synchronized with the guider host's clock. Raw camera
+pixels need a reference centroid, image scale, and camera-to-mount axis
+transform first. See [INDI setup](indi_setup.md) for the property contract.
 
-## Step 2: Plate Scale Measurement (`arcsec_per_ms_ra`)
+Guide mode rejects future, repeated, out-of-order, and stale captures. A capture
+older than `max(3 × guide_exposure, 5 seconds)` is stale; replaying a cached
+measurement does not renew freshness. The last accepted capture age is checked
+again before every pulse.
 
-The feed-forward correction must be scaled correctly to the mount's guide
-rate.  Measure `arcsec_per_ms_ra` as follows:
+For a camera pixel pitch `p` in micrometres and guide optic focal length `f` in
+millimetres, the image scale is:
 
-1. Disable guiding and tracking corrections.
-2. Send a 1000 ms West pulse via INDI:
-   ```
-   newNumberVector device="EQMod Mount" name="TELESCOPE_TIMED_GUIDE_WE"
-     oneNumber name="TIMED_GUIDE_W" value=1000
-   ```
-3. Measure the star displacement in arcseconds from the guide frame before
-   and after the pulse.
-4. `arcsec_per_ms_ra = displacement_arcsec / 1000.0`
-
-Typical value for EQ6-R at 0.5× guide rate: 1.65 arcsec/ms.
-
-## Step 3: Record PE Curve
-
-With the `arcsec_per_ms_ra` value known, run:
-
-```bash
-./target/release/stellar-dsp-pid calibrate \
-  --cycles 3 \
-  --output config/pe_curve.json
+```text
+scale = 206.265 × p / f  arcsec/pixel
 ```
 
-The calibration mode:
-- Connects to indiserver
-- Records raw guide star RA deviation for `3 × T_worm` seconds
-- Phase-bins and averages the measurements
-- Writes the PE curve to `config/pe_curve.json`
+This converts pixel motion to an angle, but not to RA/Dec. Measure the camera
+axis orientation and signs with short pulses after the mount connection and
+guide-rate setting are verified.
 
-**Minimum recommended recording time:** 2 complete worm cycles
-(16 minutes for EQ6-R / HEQ5).
+## 2. Measure pulse response before tuning feedback
 
-## Step 4: Inspect the PE Curve
+At Dec near 0, with sidereal tracking and the guide rate recorded, test short
+RA and Dec pulses in both directions. Begin at conservative durations. Measure
+the centroid displacement after each pulse, convert pixels to arcseconds, and
+subtract baseline drift. Fit displacement versus commanded milliseconds
+separately for RA+, RA−, Dec+, and Dec−. The fitted slopes, plus direction/sign
+handling, determine the effective `arcsec_per_ms_ra` and
+`arcsec_per_ms_dec` values.
 
-The PE curve JSON is a simple array of arcseconds values.  You can inspect
-it with any plotting tool:
+For reference only, a 0.5× sidereal guide rate corresponds ideally to
+`15.04157 × 0.5 / 1000 = 0.007521 arcsec/ms` at Dec 0. This is a theoretical
+starting estimate, not a mount measurement. RA image-plane scale changes with
+`cos(Dec)`; measure again at the intended observing declination when practical.
 
-```python
-import json, matplotlib.pyplot as plt
-with open("config/pe_curve.json") as f:
-    pe = json.load(f)
-plt.plot(pe)
-plt.xlabel("Phase bin (0 = start of worm cycle)")
-plt.ylabel("PE (arcseconds)")
-plt.title("Periodic Error Curve")
-plt.show()
+## 3. Record raw periodic error
+
+Raw PE must be captured with mount tracking on and guide output disabled. Use a
+guide star near the celestial equator, retain exposure timestamps, and record
+at least 55–60 minutes (six cycles at 598.36 s or seven at 480 s).
+Do not combine a guided residual with raw PE. Compare cycle-to-cycle phase and
+amplitude, and retain the 480 s and roughly 598–600 s candidates until this
+mount's data resolves the disagreement.
+
+The SkyView profile's 598.36 s is the calculation for a 144-tooth wheel, not a
+measured value. The Orion manual's 480 s PEC training interval conflicts with
+that calculation but does not itself establish the physical worm period. The
+exact wheel and controller revision still need identification.
+
+## 4. Curve capture is not yet PE playback
+
+The CLI can record values from verified `GUIDE_ERROR_ARCSEC` measurements:
+
+```sh
+cargo run -- --config path/to/profile.toml calibrate \
+  --cycles 6 --output config/pe_curve.json
 ```
 
-A good PE curve is smooth and sinusoidal.  Spike artefacts indicate
-seeing or clouds during recording.  If the curve looks noisy, re-run
-with `--cycles 5` or on a better night.
+It refuses to run without a configured measurement source, nonzero worm period,
+and at least one verified measurement. Six cycles are about 61 minutes at the
+SkyView profile's provisional 598.36-second period; use seven cycles when
+evaluating the 480-second candidate. The resulting JSON is an analysis artifact,
+not a replay-ready mount correction. Its phase origin comes from capture
+timestamps, while the mount's physical worm phase is not read by this app.
 
-## Step 5: Enable PE Correction in Config
+PE playback remains blocked in guide mode until a trustworthy physical worm
+phase reference is available. Power loss, changing the worm period, or losing
+phase requires synchronization again. A curve with an arbitrary phase can
+increase periodic error, so do not bypass that gate by setting
+`enable_pe_correction = true`.
 
-```toml
-[guider]
-enable_pe_correction = true
-pe_curve_path = "config/pe_curve.json"
-```
+## 5. Tune feedback only after units are verified
 
-## Step 6: Verify with a Test Run
-
-Run the guider for one worm cycle and compare:
-- `stats.ff_rms_ms` — feed-forward magnitude
-- `stats.ra_error_rms` — guide star RA rms
-
-With effective PE correction `stats.ra_error_rms` should drop by 30–70%
-compared to a baseline run with PE correction disabled.
+Start with PE disabled. Keep the same load, balance, pier side, guide star,
+declination, exposure, and cable routing when comparing captures. Record RA/Dec
+RMS, pulse counts and durations, backlash, wind, and any structural flexure.
+Change one setting at a time. The project has not established a performance
+target or guaranteed improvement for this mount.

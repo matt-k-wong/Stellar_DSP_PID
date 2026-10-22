@@ -23,9 +23,11 @@
 //! - Exposes a `send_pulse()` method that formats and sends guide pulse
 //!   commands to the mount driver.
 //!
-//! XML parsing is intentionally lightweight: we only match the property
-//! names we care about (guide star position and guide pulse acknowledgement)
-//! and discard everything else.
+//! XML parsing is intentionally lightweight. Raw camera centroid coordinates
+//! are ignored: only an explicit arcsecond-error property from the configured
+//! measurement device can become a guide measurement. That device may be a
+//! future centroid bridge separate from the physical camera. It must include
+//! the source capture time; local message arrival time is not a substitute.
 
 use std::sync::Arc;
 
@@ -46,7 +48,10 @@ use crate::{GuideFrame, GuidePulse};
 /// Events emitted by the INDI reader task.
 #[derive(Debug, Clone)]
 pub enum IndiEvent {
-    /// A guide star centroid update from the camera driver.
+    /// A guide error update in sky arcseconds from the configured measurement
+    /// device's `GUIDE_ERROR_ARCSEC` property, including its source capture
+    /// timestamp. The bridge's conversion is an integration contract; ordinary
+    /// camera drivers do not provide it.
     GuideFrame(GuideFrame),
     /// Mount acknowledged a guide pulse (name, west_ms, north_ms).
     PulseAck { ra_west_ms: f64, dec_north_ms: f64 },
@@ -122,11 +127,23 @@ struct IndiParser {
     prop_name:   String,
     /// True when inside a NumberVector block we care about
     in_block:    bool,
+    /// True for a property definition (which must not be treated as data).
+    is_definition: bool,
+    /// Only this configured measurement/bridge device may provide guide
+    /// measurements; it may differ from the physical camera device.
+    camera_device: String,
     /// Accumulated `<oneNumber>` values
     values:      Vec<(String, f64)>,
 }
 
 impl IndiParser {
+    fn for_camera(camera_device: &str) -> Self {
+        Self {
+            camera_device: camera_device.to_owned(),
+            ..Self::default()
+        }
+    }
+
     /// Feed one line.  Returns `Some(IndiEvent)` when a complete block is parsed.
     fn feed_line(&mut self, line: &str) -> Option<IndiEvent> {
         let trimmed = line.trim();
@@ -137,6 +154,7 @@ impl IndiParser {
                 .strip_prefix("<setNumberVector")
                 .or_else(|| trimmed.strip_prefix("<defNumberVector"))
             {
+                self.is_definition = trimmed.starts_with("<defNumberVector");
                 self.device    = extract_attr(rest, "device").unwrap_or_default();
                 self.prop_name = extract_attr(rest, "name").unwrap_or_default();
                 self.buffer.clear();
@@ -178,18 +196,49 @@ impl IndiParser {
 
     fn emit_event(&mut self) -> Option<IndiEvent> {
         match self.prop_name.as_str() {
-            // Guide star position from camera driver
-            "GUIDE_STAR_POSITION" | "RAPID_GUIDE_DATA" => {
-                let x = self.values.iter().find(|(n, _)| n.contains("X") || n.contains("RA"))
-                            .map(|(_, v)| *v).unwrap_or(0.0);
-                let y = self.values.iter().find(|(n, _)| n.contains("Y") || n.contains("DEC"))
-                            .map(|(_, v)| *v).unwrap_or(0.0);
-                let flux = self.values.iter().find(|(n, _)| n.contains("FLUX") || n.contains("SNR"))
-                            .map(|(_, v)| *v).unwrap_or(10_000.0);
+            // Explicit adapter contract: errors already converted from
+            // centroid pixels into RA/Dec sky arcseconds. Raw pixel positions
+            // (`GUIDE_STAR_POSITION`, `RAPID_GUIDE_DATA`) are deliberately not
+            // accepted because they need a reference centroid, plate scale,
+            // and camera-to-mount axis transform.
+            "GUIDE_ERROR_ARCSEC"
+                if !self.is_definition && self.device == self.camera_device =>
+            {
+                let ra = self.values.iter()
+                    .find(|(n, _)| n == "RA_ERROR_ARCSEC")
+                    .map(|(_, v)| *v);
+                let dec = self.values.iter()
+                    .find(|(n, _)| n == "DEC_ERROR_ARCSEC")
+                    .map(|(_, v)| *v);
+                let flux = self.values.iter()
+                    .find(|(n, _)| n == "STAR_FLUX")
+                    .map(|(_, v)| *v);
+                let capture_time = self.values.iter()
+                    .find(|(n, _)| n == "CAPTURE_UNIX_SECONDS")
+                    .map(|(_, v)| *v);
+                let (Some(ra), Some(dec), Some(flux), Some(capture_time)) =
+                    (ra, dec, flux, capture_time)
+                else {
+                    return Some(IndiEvent::Other {
+                        device: self.device.clone(),
+                        name: self.prop_name.clone(),
+                    });
+                };
+                if !ra.is_finite()
+                    || !dec.is_finite()
+                    || !flux.is_finite()
+                    || flux <= 0.0
+                    || !capture_time.is_finite()
+                {
+                    return Some(IndiEvent::Other {
+                        device: self.device.clone(),
+                        name: self.prop_name.clone(),
+                    });
+                }
                 let frame = GuideFrame {
-                    timestamp:        now_secs(),
-                    ra_error_arcsec:  x,
-                    dec_error_arcsec: y,
+                    timestamp:        capture_time,
+                    ra_error_arcsec:  ra,
+                    dec_error_arcsec: dec,
                     star_flux:        flux,
                     valid:            true,
                 };
@@ -218,15 +267,6 @@ fn extract_attr(s: &str, attr: &str) -> Option<String> {
     Some(s[start..end].to_owned())
 }
 
-/// Current time as seconds since UNIX epoch (platform-dependent).
-fn now_secs() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // IndiClient
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,7 +289,14 @@ impl IndiClient {
     /// * `host`         — Hostname or IP
     /// * `port`         — INDI port (default 7624)
     /// * `mount_device` — INDI device name for the mount driver
-    pub async fn connect(host: &str, port: u16, mount_device: &str) -> Result<Self> {
+    /// * `camera_device` — INDI measurement device name permitted to provide
+    ///   `GUIDE_ERROR_ARCSEC` measurements; often a future centroid bridge
+    pub async fn connect(
+        host: &str,
+        port: u16,
+        mount_device: &str,
+        camera_device: &str,
+    ) -> Result<Self> {
         let addr = format!("{host}:{port}");
         info!("Connecting to indiserver at {addr}");
         let stream = TcpStream::connect(&addr)
@@ -260,6 +307,7 @@ impl IndiClient {
         let (tcp_read, mut tcp_write) = stream.into_split();
         let (event_tx, event_rx)     = mpsc::channel::<IndiEvent>(64);
         let (xml_tx,   mut xml_rx)   = mpsc::channel::<String>(64);
+        let expected_camera_device = camera_device.to_owned();
 
         // ── Writer task: relay XML strings to TCP ─────────────────────────
         tokio::spawn(async move {
@@ -282,7 +330,7 @@ impl IndiClient {
         tokio::spawn(async move {
             let mut reader = BufReader::new(tcp_read);
             let mut line   = String::new();
-            let mut parser = IndiParser::default();
+            let mut parser = IndiParser::for_camera(&expected_camera_device);
             loop {
                 line.clear();
                 match reader.read_line(&mut line).await {

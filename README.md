@@ -1,228 +1,134 @@
-# 🔭 Stellar DSP PID
+# Stellar DSP PID
 
-**Feed-forward Active Noise Cancellation for precision telescope guiding.**
+An experimental Rust DSP guider for telescope mounts controlled through INDI.
+The project combines filtered PID feedback with an optional periodic-error
+feed-forward table. It is not a plug-and-play guiding application: a camera
+centroid bridge, measured pulse response, and mount-specific configuration are
+required before guide mode can run.
 
-> *Replaces reactive 0.5 Hz PID loops with a phase-coherent DSP engine:
-> Zero-Delay Feedback (ZDF) atmospheric noise suppression + Wavetable
-> periodic-error feed-forward injection.*
+## Start without a camera
 
-[![CI](https://github.com/your-org/Stellar_DSP_PID/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/Stellar_DSP_PID/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+The repository includes a reusable generic configuration and an illustrative
+SkyView Pro / SynScan V3 profile. The example is not an inventory of anyone's
+equipment; its profile values are placeholders or conditional estimates.
+Inspect either profile offline:
 
----
-
-## The Physics Problem
-
-Standard telescope guiding software (PHD2, MetaGuide) implements a
-**reactive PID loop** sampled at 0.5–2 Hz. This architecture has two
-fundamental failure modes:
-
-| Failure Mode | Mechanism | Effect |
-|---|---|---|
-| **Atmospheric seeing** | Differential refraction jiters the guide star centroid at 10–100 Hz | PID integral winds up on high-frequency noise, injecting *more* error |
-| **Mount periodic error (PE)** | Worm/strain-wave gear eccentricity repeats every T_worm (≈480 s) | PID lag means correction arrives a half-cycle late — amplifying PE |
-
-### The Solution: Feed-Forward DSP
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Guide Camera (0.5–2 Hz)  →  INDI TCP stream                        │
-│         │                                                            │
-│         ▼                                                            │
-│  ┌──────────────┐    star centroid error ε (arcsec)                 │
-│  │ ZDF LP Filter│  ─── strips seeing ─────────────────────────────► │
-│  │ fc = 0.05 Hz │    filtered error ε̃                               │
-│  │ Butterworth  │         │                                          │
-│  └──────────────┘         ▼                                          │
-│                    ┌─────────────┐                                   │
-│                    │  PID(ε̃)    │  feedback correction               │
-│                    └─────────────┘         │                         │
-│                                            ▼                         │
-│  ┌──────────────────────────┐       ┌─────────┐   pulse (ms)        │
-│  │ PE Wavetable (10 Hz tick)│ ────► │  Σ      │ ────────────────►  │
-│  │ -E(φ) @ worm phase       │  ff   └─────────┘   INDI mount cmd   │
-│  └──────────────────────────┘                                        │
-└──────────────────────────────────────────────────────────────────────┘
+```sh
+cargo run -- --config config/default.toml inspect
+cargo run -- --config config/profiles/skyview-pro-example.toml inspect
 ```
 
-**Why ZDF?**
-A conventional biquad IIR filter introduces up to −180° phase shift near
-its cutoff frequency. At fc = 0.05 Hz the correction arrives several
-seconds *after* the tracking error — making guiding worse.
+`inspect` reads the TOML file and reports assumptions. It does not connect to
+INDI, check hardware, or send mount commands. The illustrative SkyView setup
+guide explains how to identify a mount, handset, and adapter, and which values
+need measurement: [docs/skyview_pro_example_setup.md](docs/skyview_pro_example_setup.md).
+The guide also includes an offline Mac script for collecting the adapter's
+local Wi-Fi route and, optionally, raw replies to read-only inquiries: [probe_synscan_wifi.py](scripts/probe_synscan_wifi.py).
+With no subcommand, the CLI runs this offline inspection. Start mount guiding
+only with the explicit `guide` subcommand.
 
-A Zero-Delay Feedback filter (Zavalishin topology) uses the trapezoidal
-rule to discretise the analogue prototype. The feedback path contains
-**no unit delay**, giving:
-- Zero phase error at DC
-- Monotonically increasing group delay (no overshoot)
-- Phase margin preserved for the outer guide loop
+## Profiles
 
-**Why a Wavetable?**
-The worm gear periodic error E(φ) is highly repeatable (σ < 5% cycle-to-cycle).
-We measure −E(φ) over 3–5 worm cycles during calibration, store it in a
-4096-entry lookup table, and *inject the inverse* continuously at the DSP
-rate (10 Hz). The feed-forward correction cancels PE **before** it registers
-on the guide star, effectively rendering the worm gear transparent.
+Profiles are ordinary TOML files selected with `--config`. Use
+`config/default.toml` as a generic template or copy a file into
+`config/profiles/` for a mount and controller combination. Mark every period,
+guide rate, driver name, and camera as either measured, manufacturer-listed,
+calculated, or unverified in its comments. See the
+[equipment discovery and profile guide](docs/gear_profile_discovery.md) for a
+reusable inventory, measurement, and provenance workflow.
 
----
+The SkyView example leaves the camera device empty, PE disabled, and
+aggressiveness at zero. It records two conditional calculations:
 
-## Theory of Operation
+- A 598.36 s worm period assuming a 144-tooth wheel. This is not measured and
+  differs from the SkyView Pro manual's 480 s PEC-training interval, which is
+  not itself a measured worm period.
+- A 0.007521 arcsec/ms ideal guide scale for 0.5× sidereal at Dec 0. This is a
+  theoretical example, not a selected rate or measured pulse response.
 
-See [docs/theory_of_operation.md](docs/theory_of_operation.md) for the
-full mathematical derivation including:
-- Trapezoidal integration and the ZDF substitution s → 2(z-1)/(T(z+1))
-- Zavalishin SVF state equations
-- Hermite cubic interpolation for sub-sample wavetable readout
-- Phase-binning calibration algorithm
-- Kalman smoother roadmap for future seeing estimation
+The profile's `EQMod Mount` device name and direct Wi-Fi adapter route are
+candidates only. Pulse-guiding support for a specific SynScan V3 / SkyView Pro
+setup must be verified. See [INDI setup](docs/indi_setup.md).
 
----
+## Camera and measurement requirements
 
-## Hardware Bill of Materials
+The guider accepts measurements only from the configured INDI measurement
+device's `GUIDE_ERROR_ARCSEC` property, containing signed `RA_ERROR_ARCSEC`,
+`DEC_ERROR_ARCSEC`, positive `STAR_FLUX`, and `CAPTURE_UNIX_SECONDS` values.
+The timestamp must be the source capture time in Unix seconds, not the INDI
+message arrival time. These error values must already be converted to sky-axis
+arcseconds. Raw `GUIDE_STAR_POSITION` and
+`RAPID_GUIDE_DATA` pixel coordinates are ignored because they need a reference
+centroid, image scale, and camera-to-mount axis transform.
 
-### Option A — DIY Budget Build (~$120 USD)
+For pixel pitch `p` in micrometres and guide focal length `f` in millimetres:
 
-| Qty | Part | Approx. Price | Notes |
-|-----|------|--------------|-------|
-| 1 | Raspberry Pi 5 (4 GB) | $60 | Main SBC |
-| 1 | ZWO ASI120MM Mini | $99 | Guide camera |
-| 1 | 50mm f/4 guide scope | $45 | Finder-scope style |
-| 1 | 32 GB microSD (A2) | $10 | Fast random I/O for logs |
-| 1 | 3D-printed Vixen shoe enclosure | ~$3 filament | See below |
-| 1 | 3D-printed cable strain relief | ~$1 filament | See below |
-| 1 | USB 3.0 hub (powered) | $15 | Camera + mount USB |
-| 1 | USB-C 45W GaN charger | $18 | For Pi 5 |
+```text
+image scale = 206.265 × p / f  arcsec/pixel
+```
 
-**Total: ~$251 with camera, ~$103 without**
+`indi.camera_device` names the device publishing this property. It may name a
+future centroid bridge and can differ from the physical guide camera. Ordinary
+camera drivers expose images or pixels and do not publish this project-specific
+property. The project does not include the centroiding bridge yet. Guide mode
+also requires identified mount and measurement source devices, nonzero tuned
+aggressiveness, and fresh measurements. Capture timestamps must increase
+strictly and not be in the future. Captures older than
+`max(3 × guide_exposure, 5 seconds)` are rejected. Repeated cached samples do
+not renew freshness, and guiding pauses as soon as the last accepted capture
+exceeds that age.
+See [calibration notes](docs/calibration_guide.md).
 
-### Option B — ASIAIR Pro (~$900 USD)
+## Periodic error
 
-| Item | Price |
-|------|-------|
-| ASIAIR Plus 256 GB | $329 |
-| ZWO ASI120MM Mini (guide) | $99 |
-| ZWO ASI2600MC Pro (main) | $1,799 |
-| ZWO AM5 Mount | $1,299 |
+PE correction is disabled in the supplied profiles. A measured curve must be
+synchronized to a physical worm-phase reference before playback; this app does
+not yet receive that reference. Setting a period or loading a curve alone is
+not enough. The `calibrate` command requires a configured measurement source and
+verified arcsecond measurements, and its timestamp-binned output is not
+replay-ready without phase synchronization.
 
-*The ASIAIR runs an older guide algorithm with no ZDF filtering or
-feed-forward PE correction. Stellar DSP PID achieves comparable or
-superior RMS guide error on budget hardware.*
+## Commands
 
----
+```sh
+# Offline profile inspection
+cargo run -- --config config/profiles/skyview-pro-example.toml inspect
 
-## 3D-Printed Components
+# Guide only after hardware, camera conversion, pulse response, and settings
+# are verified and configured
+cargo run -- --config path/to/profile.toml guide
 
-### Part 1: Vixen Shoe SBC Enclosure
+# Capture raw measurements for later analysis; this does not send guide pulses
+cargo run -- --config path/to/profile.toml calibrate --cycles 6 \
+  --output config/pe_curve.json
 
-**Purpose:** Mounts the Raspberry Pi to the telescope dovetail saddle,
-keeping the compute close to the mount electronics to minimise cable length.
+# Print the DSP filter response
+cargo run -- --config path/to/profile.toml freqplot --points 256
+```
 
-**Specifications:**
-- Material: PETG (thermal stability, low creep under outdoor temperatures)
-- Infill: 40% gyroid
-- Wall count: 4 perimeters
-- Layer height: 0.2 mm
-- Supports: Required for Vixen dovetail dove-tails
-- Hardware: 4× M3×10 button-head screws, 4× M3 heat-set inserts
-- Vixen dovetail groove: 43.7 mm width, 9.5 mm height, 4° taper (standard)
-- Pi 5 footprint: 85 × 56 mm with 3.5 mm M2.5 standoffs
+## Implementation layout
 
-**Ventilation:** Two 20× 5 mm slot vents on opposing faces with 0.6 mm
-mesh skin; empirical testing shows ≤8°C delta above ambient at 5 W load.
+```text
+src/config.rs          TOML profiles and configuration validation
+src/main.rs            CLI, offline inspect, capture and guide commands
+src/guider.rs          INDI event handling and fail-closed guide state machine
+src/indi_client.rs     INDI TCP client and verified measurement property parser
+src/dsp/anc.rs         PID/ANC engine
+src/dsp/wavetable.rs   Phase-synchronized periodic-error table
+config/default.toml    Generic safe template
+config/profiles/       Gear-specific profile files
+docs/                  Setup, INDI, theory, and calibration notes
+```
 
-### Part 2: Cable Strain Relief Clip
+## Build
 
-**Purpose:** Anchors the USB and guide camera cables to the scope tube,
-preventing cable snag during meridian flips which would corrupt guide frames.
+Requires Rust 1.75 or newer. The library and CLI can be built with:
 
-**Specifications:**
-- Material: TPU 95A (flexible, UV-stable)
-- Print temp: 220°C / 50°C bed
-- Layer height: 0.25 mm
-- No supports required
-- Attaches via 25 mm nylon zip tie through integrated lanyard holes
-- Cable channel ID: 8 mm (fits USB-C + 6-pin mini-USB side by side)
-
-**STL files:** `hardware/stl/vixen_sbc_enclosure.stl`,
-`hardware/stl/cable_strain_relief.stl`
-*(Community-contributed; verify fit before printing final version)*
-
----
-
-## Software Dependencies
-
-- `indiserver` ≥ 1.9.9 (from INDI library)
-- INDI camera driver for your guide camera (e.g., `indi_asi_ccd`)
-- INDI mount driver (e.g., `indi_eqmod` for SkyWatcher)
-- Rust ≥ 1.75
-
-### Quick Start
-
-```bash
-# 1. Install INDI (Ubuntu/Debian)
-sudo apt-get install indi-bin indi-asi
-
-# 2. Start indiserver with your drivers
-indiserver indi_asi_ccd indi_eqmod
-
-# 3. Build Stellar DSP PID
+```sh
 cargo build --release
-
-# 4. Run with default config
-./target/release/stellar-dsp-pid --config config/default.toml
-
-# 5. Calibrate PE (first run — let it record 2 worm cycles)
-./target/release/stellar-dsp-pid --calibrate --calibrate-output config/pe_curve.json
 ```
 
-### Configuration
-
-Edit `config/default.toml` to match your hardware:
-
-```toml
-[mount]
-worm_period_secs   = 480.0    # EQ6-R: 480 s, HEQ5: 480 s, EQ3-2: 240 s
-arcsec_per_ms_ra   = 1.65     # calibrate with drift alignment
-arcsec_per_ms_dec  = 1.65
-
-[dsp]
-sample_rate        = 10.0     # internal DSP Hz (oversampling ratio)
-filter_cutoff_hz   = 0.05     # seeing rejection threshold
-filter_q           = 0.7071   # Butterworth (no resonance)
-
-[indi]
-host               = "localhost"
-port               = 7624
-camera_device      = "ZWO CCD ASI120MM Mini"
-mount_device       = "EQMod Mount"
-guide_exposure     = 2.0      # seconds
-```
-
----
-
-## Architecture
-
-```
-src/
-├── lib.rs                 Re-exports all public modules
-├── main.rs                Tokio runtime bootstrap + CLI
-├── config.rs              TOML configuration structures
-├── guider.rs              Top-level guiding state machine
-├── indi_client.rs         Async INDI TCP client (XML protocol)
-└── dsp/
-    ├── mod.rs             DSP module declarations
-    ├── zdf_filter.rs      Zero-Delay Feedback SVF filter bank
-    ├── wavetable.rs       Periodic error correction wavetable
-    ├── anc.rs             Active Noise Cancellation engine
-    └── pid.rs             PID with anti-windup + derivative filter
-```
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for project contribution guidance.
 
 ## License
 
